@@ -1,0 +1,9 @@
+streamlit
+pandas
+requests
+plotly
+ta
+feedparser
+textblob
+urllib3
+python-telegram-bot==13.15
