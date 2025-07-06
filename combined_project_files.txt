@@ -1,6 +1,171 @@
 
 --- START FILE: app.py ---
 
+# app.py
+
+import streamlit as st
+import plotly.graph_objects as go
+from btc_data import fetch_ohlcv, add_technical_indicators, get_current_price
+from sentiment import get_bitcoin_sentiment
+from probo_strategy import interpret_market_conditions
+from predictor import recommend_probo_vote_for_target
+from telegram_bot import send_telegram_alert
+from datetime import datetime, timedelta
+
+st.set_page_config(page_title="BTC Probo Predictor", layout="wide", initial_sidebar_state="collapsed")
+
+st.markdown("""
+    <style>
+    @media (max-width: 600px) {
+        .css-18ni7ap { padding-left: 0.5rem; padding-right: 0.5rem; }
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+st.title("📲 BTC Probo Predictor (Mobile Friendly)")
+
+# Fetch market data
+with st.spinner("Loading BTC data..."):
+    df = fetch_ohlcv()
+    df = add_technical_indicators(df)
+    current_price = get_current_price()
+    sentiment_score = get_bitcoin_sentiment()
+    market = interpret_market_conditions(df)
+
+st.metric("💰 BTC Price", f"${current_price:,.2f}")
+st.markdown("---")
+
+# 📥 Prediction form
+st.subheader("🔮 Predict Probo Outcome")
+with st.form("predict_form"):
+    col1, col2 = st.columns(2)
+    with col1:
+        target_price = st.number_input("Target Price (USDT)", value=65000)
+    with col2:
+        target_time_str = st.text_input("Target Time (HH:MM in IST)", value="23:00")
+
+    predict = st.form_submit_button("Get Recommendation")
+
+if predict:
+    try:
+        # Convert IST time to UTC
+        ist_time = datetime.strptime(target_time_str.strip(), "%H:%M")
+        now_utc = datetime.utcnow()
+        today_ist = now_utc + timedelta(hours=5.5)
+        target_time_ist = today_ist.replace(hour=ist_time.hour, minute=ist_time.minute, second=0, microsecond=0)
+        target_time_utc = target_time_ist - timedelta(hours=5.5)
+        parsed_time = target_time_utc.strftime("%H:%M")
+
+        # Run prediction
+        result = recommend_probo_vote_for_target(target_price, parsed_time)
+
+        # Display summary
+        with st.expander("📊 Prediction Summary", expanded=True):
+            st.markdown(f"**Current Price:** ${result['current_price']}")
+            st.markdown(f"**Avg Δ/hr:** ${result['avg_delta_per_hour']}")
+            st.markdown(f"**Time Left:** {result['hours_remaining']} hr(s)")
+            st.markdown(f"**Projected Price:** ${result['projected_price']}")
+            st.markdown(f"**Sentiment Score:** {result['sentiment']}")
+            st.markdown(f"**Target Time (IST):** {target_time_str}")
+
+        st.success(f"🧠 Recommended Vote: **{result['vote']}**")
+
+        # Send Telegram Alert
+        alert_message = (
+            f"📣 *BTC Probo Vote Recommendation*\n"
+            f"🕒 Target Time (IST): *{target_time_str}*\n"
+            f"🎯 Target Price: *${result['target_price']}*\n"
+            f"💰 Current: *${result['current_price']}*\n"
+            f"📈 Projected: *${result['projected_price']}*\n"
+            f"💬 Sentiment: *{result['sentiment']}*\n"
+            f"✅ Vote: *{result['vote']}*"
+        )
+        send_telegram_alert(alert_message)
+
+    except ValueError:
+        st.error("❌ Invalid time format. Please enter as HH:MM in 24-hour IST.")
+
+# 📈 Technicals
+with st.expander("🧪 Technical Indicators"):
+    col1, col2, col3 = st.columns(3)
+    col1.metric("RSI", f"{market['rsi']:.2f}")
+    col2.metric("EMA 20", f"{market['ema_20']:.2f}")
+    col3.metric("EMA 50", f"{market['ema_50']:.2f}")
+    st.markdown(
+        f"**Trend**: {'📈 Uptrend' if market['bullish_trend'] else '📉 Downtrend'}  \n"
+        f"**RSI Zone**: {'🔥 Overbought' if market['overbought'] else '🧊 Oversold' if market['oversold'] else '✅ Neutral'}"
+    )
+
+# 📊 Chart
+with st.expander("📊 View Chart"):
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=df.index, open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="Candles"))
+    fig.add_trace(go.Scatter(x=df.index, y=df["EMA_20"], mode='lines', name='EMA 20'))
+    fig.add_trace(go.Scatter(x=df.index, y=df["EMA_50"], mode='lines', name='EMA 50'))
+    fig.update_layout(height=400, xaxis_rangeslider_visible=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+--- END FILE: app.py ---
+
+--- START FILE: btc_data.py ---
+
+# btc_data.py
+
+import requests
+import pandas as pd
+import time
+from ta.momentum import RSIIndicator
+from ta.trend import EMAIndicator
+
+BINANCE_BASE_URL = "https://api.binance.com"
+
+def fetch_ohlcv(symbol="BTCUSDT", interval="1h", limit=100):
+    url = f"{BINANCE_BASE_URL}/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    response = requests.get(url, params=params)
+    data = response.json()
+
+    df = pd.DataFrame(data, columns=[
+        "timestamp", "open", "high", "low", "close", "volume",
+        "close_time", "quote_asset_volume", "num_trades",
+        "taker_buy_base_vol", "taker_buy_quote_vol", "ignore"
+    ])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df.set_index("timestamp", inplace=True)
+    df = df.astype(float)
+
+    return df[["open", "high", "low", "close", "volume"]]
+
+def add_technical_indicators(df):
+    rsi = RSIIndicator(df["close"], window=14).rsi()
+    ema_20 = EMAIndicator(df["close"], window=20).ema_indicator()
+    ema_50 = EMAIndicator(df["close"], window=50).ema_indicator()
+
+    df["RSI"] = rsi
+    df["EMA_20"] = ema_20
+    df["EMA_50"] = ema_50
+    return df
+
+def get_current_price(symbol="BTCUSDT"):
+    url = f"{BINANCE_BASE_URL}/api/v3/ticker/price?symbol={symbol}"
+    response = requests.get(url)
+    return float(response.json()["price"])
+
+if __name__ == "__main__":
+    df = fetch_ohlcv()
+    df = add_technical_indicators(df)
+    print(df.tail())
+    print(f"Current BTC Price: ${get_current_price()}")
+
+
+--- END FILE: btc_data.py ---
+
+--- START FILE: combined_project_files.txt ---
+
+
+--- START FILE: app.py ---
+
 # app.py (mobile-optimized)
 
 import streamlit as st
@@ -782,6 +947,280 @@ if __name__ == "__main__":
 
 
 --- END FILE: probo_strategy.py ---
+
+--- START FILE: sentiment.py ---
+
+# sentiment.py (Fixed)
+
+import feedparser
+from textblob import TextBlob
+import urllib.parse
+import streamlit as st
+
+def fetch_news_sentiment(query="bitcoin", max_items=20):
+    encoded_query = urllib.parse.quote(query)  # URL encode the query
+    url = f"https://news.google.com/rss/search?q={encoded_query}"
+    
+    feed = feedparser.parse(url)
+    headlines = [entry.title for entry in feed.entries[:max_items]]
+
+    if not headlines:
+        return 0  # Neutral if no news
+
+    sentiments = [TextBlob(headline).sentiment.polarity for headline in headlines]
+    return round(sum(sentiments) / len(sentiments), 3)
+
+@st.cache_data(ttl=600)
+def get_bitcoin_sentiment():
+    return fetch_news_sentiment("bitcoin OR btc")
+
+
+--- END FILE: sentiment.py ---
+
+--- START FILE: telegram_bot.py ---
+
+# telegram_bot.py
+
+import requests
+
+# Your bot token and user ID
+BOT_TOKEN = "7961650111:AAEUAwXv16l3Pb_9EFT_Umy0fYNjN5ijAqU"
+USER_ID = 5368095453  # You can also use your numeric ID if this fails
+
+def send_telegram_alert(message):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": USER_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    try:
+        response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            print("Telegram alert sent successfully.")
+        else:
+            print("Failed to send alert:", response.text)
+    except Exception as e:
+        print("Telegram alert error:", str(e))
+
+# Test message
+if __name__ == "__main__":
+    send_telegram_alert("🚨 Test alert from BTC Probo Predictor!")
+
+
+--- END FILE: telegram_bot.py ---
+
+
+--- END FILE: combined_project_files.txt ---
+
+--- START FILE: combine_project.py ---
+
+import os
+
+def combine_files_to_single_file(root_dir, output_filename="combined_project_files.txt"):
+    """
+    Combines the content of all files in a directory into a single file,
+    excluding 'node_modules' directories and 'package-lock.json' files.
+
+    Args:
+        root_dir (str): The root directory of the project.
+        output_filename (str): The name of the output file.
+    """
+    combined_content = []
+    excluded_dirs = ['node_modules', '.git', '.vscode', '.idea', 'dist', 'build']
+    excluded_files = ['package-lock.json', 'yarn.lock', 'bun.lockb', '.env'] # Added .env as it might contain sensitive info
+
+    print(f"Starting to combine files from: {root_dir}")
+    print(f"Excluding directories: {excluded_dirs}")
+    print(f"Excluding files: {excluded_files}")
+
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        # Modify dirnames in-place to skip excluded directories
+        dirnames[:] = [d for d in dirnames if d not in excluded_dirs]
+
+        for filename in filenames:
+            if filename in excluded_files:
+                print(f"Skipping excluded file: {os.path.join(dirpath, filename)}")
+                continue
+
+            file_path = os.path.join(dirpath, filename)
+            # Make path relative to root_dir for the header
+            relative_file_path = os.path.relpath(file_path, root_dir)
+
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                combined_content.append(f"\n--- START FILE: {relative_file_path} ---\n\n")
+                combined_content.append(content)
+                combined_content.append(f"\n\n--- END FILE: {relative_file_path} ---\n")
+                print(f"Included file: {relative_file_path}")
+            except UnicodeDecodeError:
+                print(f"Skipping binary or undecodable file (UnicodeDecodeError): {relative_file_path}")
+            except Exception as e:
+                print(f"Error reading file {relative_file_path}: {e}")
+
+    output_path = os.path.join(root_dir, output_filename)
+    try:
+        with open(output_path, 'w', encoding='utf-8') as outfile:
+            outfile.write("".join(combined_content))
+        print(f"\nSuccessfully combined all files into: {output_path}")
+    except Exception as e:
+        print(f"Error writing output file {output_path}: {e}")
+
+if __name__ == "__main__":
+    # Get the current working directory where the script is run
+    # This assumes you run the script from your project's root directory
+    project_root = os.getcwd()
+    combine_files_to_single_file(project_root)
+
+
+--- END FILE: combine_project.py ---
+
+--- START FILE: predictor.py ---
+
+# predictor.py
+
+from btc_data import fetch_ohlcv, add_technical_indicators, get_current_price
+from sentiment import get_bitcoin_sentiment
+import datetime
+
+def predict_future_price(hours_ahead=1):
+    df = fetch_ohlcv(interval="1h", limit=10)
+    df = add_technical_indicators(df)
+
+    # Calculate avg price movement per hour
+    df["price_change"] = df["close"].diff()
+    avg_delta = df["price_change"].mean()
+
+    current_price = get_current_price()
+    projected_price = current_price + (avg_delta * hours_ahead)
+
+    return round(projected_price, 2), round(avg_delta, 2), current_price
+
+def recommend_probo_vote_for_target(target_price, target_time_str):
+    # 1. Parse time and calculate hours remaining
+    now = datetime.datetime.utcnow()
+    target_time = datetime.datetime.strptime(target_time_str, "%H:%M")
+    target_time = now.replace(hour=target_time.hour, minute=target_time.minute, second=0, microsecond=0)
+    
+    if target_time < now:
+        target_time += datetime.timedelta(days=1)
+
+    hours_remaining = (target_time - now).total_seconds() / 3600
+    hours_remaining = max(0.25, round(hours_remaining, 2))  # Minimum 15 min window
+
+    # 2. Get sentiment
+    sentiment = get_bitcoin_sentiment()
+
+    # 3. Predict price
+    projected, delta, current = predict_future_price(hours_remaining)
+
+    # 4. Decision logic
+    if projected >= target_price and sentiment >= -0.1:
+        vote = "YES"
+    else:
+        vote = "NO"
+
+    # 5. Return analysis
+    result = {
+        "current_price": current,
+        "avg_delta_per_hour": delta,
+        "hours_remaining": hours_remaining,
+        "projected_price": projected,
+        "sentiment": sentiment,
+        "target_price": target_price,
+        "target_time": target_time.strftime("%H:%M"),
+        "vote": vote
+    }
+
+    return result
+
+if __name__ == "__main__":
+    # Sample example:
+    question = recommend_probo_vote_for_target(target_price=63500, target_time_str="23:00")
+    
+    print("\n🧠 Prediction Summary:")
+    for k, v in question.items():
+        print(f"{k.replace('_', ' ').title()}: {v}")
+
+
+--- END FILE: predictor.py ---
+
+--- START FILE: probo_strategy.py ---
+
+# probo_strategy.py
+
+from btc_data import fetch_ohlcv, add_technical_indicators, get_current_price
+from sentiment import get_bitcoin_sentiment
+
+def interpret_market_conditions(df):
+    latest = df.iloc[-1]
+    rsi = latest["RSI"]
+    ema_20 = latest["EMA_20"]
+    ema_50 = latest["EMA_50"]
+
+    # Trend signal
+    bullish_trend = ema_20 > ema_50
+    oversold = rsi < 30
+    overbought = rsi > 70
+
+    return {
+        "bullish_trend": bullish_trend,
+        "oversold": oversold,
+        "overbought": overbought,
+        "rsi": rsi,
+        "ema_20": ema_20,
+        "ema_50": ema_50
+    }
+
+def recommend_probo_vote():
+    print("[+] Fetching market data...")
+    df = fetch_ohlcv()
+    df = add_technical_indicators(df)
+    market = interpret_market_conditions(df)
+    price = get_current_price()
+
+    print("[+] Analyzing sentiment...")
+    sentiment_score = get_bitcoin_sentiment()
+
+    print("\n📊 BTC Market Snapshot")
+    print(f"Price: ${price}")
+    print(f"RSI: {market['rsi']:.2f} | EMA20: {market['ema_20']:.2f} | EMA50: {market['ema_50']:.2f}")
+    print(f"Sentiment Score: {sentiment_score} ({'Bullish' if sentiment_score > 0 else 'Bearish' if sentiment_score < 0 else 'Neutral'})")
+
+    # Decision logic
+    vote = "NO"
+    if market["bullish_trend"] and sentiment_score > 0:
+        vote = "YES"
+    elif market["oversold"] and sentiment_score > -0.1:
+        vote = "YES"
+    elif market["overbought"] and sentiment_score < 0:
+        vote = "NO"
+
+    print(f"\n🧠 Probo Recommendation: ✅ Vote {vote}")
+    return vote
+
+if __name__ == "__main__":
+    recommend_probo_vote()
+
+
+--- END FILE: probo_strategy.py ---
+
+--- START FILE: requirements.txt ---
+
+streamlit
+pandas
+requests
+plotly
+ta
+feedparser
+textblob
+urllib3
+python-telegram-bot==13.15
+
+
+--- END FILE: requirements.txt ---
 
 --- START FILE: sentiment.py ---
 
